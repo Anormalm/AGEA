@@ -51,6 +51,9 @@ data/elliptic/
 data/amazon/
 data/FakeNews/
 
+# Shell scripts (may contain local paths)
+*.sh
+
 # Logs and temp outputs
 *.log
 *.txt
