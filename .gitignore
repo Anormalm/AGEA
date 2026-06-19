@@ -37,16 +37,19 @@ venv/
 ai-plugin-lock.json
 ai-plugin.json
 
+# Old nested directory (files moved to root)
+agea/
+
 # Paper (managed on Overleaf)
-agea/AuthorKit27/
+AuthorKit27/
 
 # Datasets (large, download separately)
-agea/dataset/
-agea/data/yelpchi/
-agea/data/dgraphfin/
-agea/data/elliptic/
-agea/data/amazon/
-agea/data/FakeNews/
+dataset/
+data/yelpchi/
+data/dgraphfin/
+data/elliptic/
+data/amazon/
+data/FakeNews/
 
 # Logs and temp outputs
 *.log
