@@ -1,0 +1,47 @@
+dataset:
+  name: fakenews_buzzfeed
+  root: ./dataset/FakeNews
+  feature_dim: 10
+
+policy:
+  type: heuristic
+  max_steps: 6
+  budget_tokens: 2048
+  budget_nodes: 50
+  budget_edges: 200
+
+graph_tools:
+  ppr_alpha: 0.15
+  ppr_topk: 10
+  community_resolution: 1.0
+  cycle_length: 3
+  prune_topk: 10
+  expand_max_neighbors: 20
+
+prompt:
+  mode: raw
+  max_neighbor_summaries: 15
+  max_edge_summaries: 30
+
+reward:
+  beta: 0.1
+  gamma: 0.001
+  eta: 0.01
+
+training:
+  lr: 1e-4
+  epochs: 100
+  batch_size: 64
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.3
+
+grpo:
+  K: 4
+  clip_eps: 0.2
+  entropy_coeff: 0.01
+
+evaluation:
+  metrics: [auroc, auprc, f1, recall_k]
+  recall_k: 100
+  eval_split: test

@@ -1,7 +1,7 @@
 """Raw evidence prompt builder — includes full feature details."""
 
 import torch
-from typing import Set, Dict, List, Optional
+from typing import Set, Dict, Optional
 
 
 class RawPromptBuilder:
@@ -16,7 +16,8 @@ class RawPromptBuilder:
               edge_index: torch.Tensor, x: torch.Tensor,
               y: torch.Tensor = None,
               node_text: Dict = None, edge_text: Dict = None,
-              struct_stats: Dict = None, budget_info: Dict = None) -> str:
+              struct_stats: Dict = None, budget_info: Dict = None,
+              adj: dict = None) -> str:
         parts = []
 
         # Target node features
@@ -25,7 +26,6 @@ class RawPromptBuilder:
             parts.append(f"Description: {node_text[str(target_node)]}")
         if target_node < x.size(0):
             feat = x[target_node]
-            # Summarize features (top-5 by magnitude)
             topk_vals, topk_idx = feat.abs().topk(min(5, feat.size(0)))
             feat_summary = ", ".join(
                 f"f{idx.item()}={feat[idx].item():.3f}" for idx in topk_idx)
@@ -50,18 +50,28 @@ class RawPromptBuilder:
                 parts.append(
                     f"  Node {n}{label_str}{text_str}: norm={feat.norm().item():.2f}")
 
-        # Edge summaries
-        src, dst = edge_index
-        ev_list = list(evidence_nodes)
-        ev_set = evidence_nodes
+        # Edge summaries — use adj dict instead of scanning 17M edges
         edge_count = 0
         parts.append(f"\n=== Edge Summaries ===")
-        for s, d in zip(src, dst):
-            if s.item() in ev_set and d.item() in ev_set:
+        if adj is not None:
+            for n in evidence_nodes:
                 if edge_count >= self.max_edge_summaries:
                     break
-                parts.append(f"  Edge {s.item()} -> {d.item()}")
-                edge_count += 1
+                for nb in adj.get(n, set()):
+                    if nb in evidence_nodes:
+                        parts.append(f"  Edge {n} -> {nb}")
+                        edge_count += 1
+                        if edge_count >= self.max_edge_summaries:
+                            break
+        else:
+            src, dst = edge_index
+            ev_set = evidence_nodes
+            for s, d in zip(src, dst):
+                if s.item() in ev_set and d.item() in ev_set:
+                    if edge_count >= self.max_edge_summaries:
+                        break
+                    parts.append(f"  Edge {s.item()} -> {d.item()}")
+                    edge_count += 1
         parts.append(f"Total evidence edges: {edge_count}")
 
         # Structural patterns
@@ -79,7 +89,6 @@ class RawPromptBuilder:
             parts.append(f"Nodes retrieved: {budget_info.get('nodes', 0)}")
             parts.append(f"Edges retrieved: {budget_info.get('edges', 0)}")
 
-        # Final instruction
         parts.append("\n=== Task ===")
         parts.append("Based on the above evidence, predict whether the target node "
                       "is involved in fraud (1) or is legitimate (0).")

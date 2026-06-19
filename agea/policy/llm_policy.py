@@ -1,7 +1,6 @@
-"""LLM-guided AGEA policy — uses an LLM to select graph tools."""
+"""LLM-guided AGEA policy — uses an LLM to select graph tools (adj-dict based)."""
 
 import json
-import torch
 from typing import Set, List, Dict, Optional
 
 
@@ -60,14 +59,10 @@ class LLMPolicy:
 Choose one action: Expand1Hop, Expand2Hop, PPRTopK, Community, ShortCycle, PruneTopK, Stop"""
 
     def get_state_summary(self, target_node: int, evidence_nodes: Set[int],
-                          edge_index: torch.Tensor, x: torch.Tensor,
-                          y: torch.Tensor, prev_actions: List[str],
+                          adj: dict, y, prev_actions: List[str],
                           token_estimate: int) -> Dict:
         num_nodes = len(evidence_nodes)
-        src, dst = edge_index
-        mask = [(s.item() in evidence_nodes and d.item() in evidence_nodes)
-                for s, d in zip(src, dst)]
-        num_edges = sum(mask)
+        num_edges = sum(len(adj.get(n, set()) & evidence_nodes) for n in evidence_nodes)
         suspicious = sum(1 for n in evidence_nodes if n < len(y) and y[n] == 1)
         density = num_edges / max(num_nodes * (num_nodes - 1), 1)
 
@@ -85,7 +80,6 @@ Choose one action: Expand1Hop, Expand2Hop, PPRTopK, Community, ShortCycle, Prune
         }
 
     def _call_llm(self, messages: List[Dict]) -> str:
-        """Call the LLM API."""
         try:
             from openai import OpenAI
             client = OpenAI(api_key=self.api_key, base_url=self.api_base)
@@ -101,8 +95,6 @@ Choose one action: Expand1Hop, Expand2Hop, PPRTopK, Community, ShortCycle, Prune
             return "Stop"
 
     def select_action(self, state: Dict) -> str:
-        """Use LLM to select the next action."""
-        # Budget check — no LLM needed
         if state["token_estimate"] >= state["budget_tokens"]:
             return "Stop"
         if state["num_evidence_nodes"] >= state["budget_nodes"]:
@@ -117,18 +109,15 @@ Choose one action: Expand1Hop, Expand2Hop, PPRTopK, Community, ShortCycle, Prune
 
         action = self._call_llm(messages)
 
-        # Validate action
         if action in ACTIONS:
             return action
 
-        # Fallback: simple heuristic
         if state["num_evidence_nodes"] <= 1:
             return "Expand1Hop"
         return "Stop"
 
-    def run_episode(self, target_node: int, edge_index: torch.Tensor,
-                    x: torch.Tensor, y: torch.Tensor,
-                    tools: dict) -> tuple:
+    def run_episode(self, target_node: int, adj: dict,
+                    x, y, tools: dict) -> tuple:
         evidence_nodes = {target_node}
         prev_actions = []
         token_estimate = 0
@@ -136,7 +125,7 @@ Choose one action: Expand1Hop, Expand2Hop, PPRTopK, Community, ShortCycle, Prune
 
         for step in range(self.max_steps):
             state = self.get_state_summary(
-                target_node, evidence_nodes, edge_index, x, y,
+                target_node, evidence_nodes, adj, y,
                 prev_actions, token_estimate)
 
             action = self.select_action(state)
@@ -149,10 +138,10 @@ Choose one action: Expand1Hop, Expand2Hop, PPRTopK, Community, ShortCycle, Prune
                 break
 
             if action == "PruneTopK":
-                new_nodes, info = tool(evidence_nodes, edge_index,
-                                       x.size(0), x=x, target_node=target_node)
+                new_nodes, info = tool(evidence_nodes, adj,
+                                       x=x, target_node=target_node)
             else:
-                new_nodes, info = tool(evidence_nodes, edge_index, x.size(0),
+                new_nodes, info = tool(evidence_nodes, adj,
                                        max_nodes=self.budget_nodes)
 
             evidence_nodes = new_nodes

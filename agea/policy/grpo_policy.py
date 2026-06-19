@@ -1,4 +1,4 @@
-"""GRPO-learned AGEA policy — Group Relative Policy Optimization."""
+"""GRPO-learned AGEA policy — Group Relative Policy Optimization (adj-dict based)."""
 
 import torch
 import torch.nn as nn
@@ -30,7 +30,6 @@ class PolicyNetwork(nn.Module):
 
 
 def state_to_vector(state: Dict, state_dim: int = 16) -> torch.Tensor:
-    """Convert state summary dict to fixed-dim vector."""
     features = [
         state.get("num_evidence_nodes", 0) / 100.0,
         state.get("num_evidence_edges", 0) / 500.0,
@@ -41,7 +40,7 @@ def state_to_vector(state: Dict, state_dim: int = 16) -> torch.Tensor:
         state.get("budget_nodes", 50) / 100.0,
         state.get("steps_taken", 0) / 10.0,
         1.0 if state.get("num_evidence_nodes", 0) <= 1 else 0.0,
-        state.get("density", 0.0) > 0.5,
+        float(state.get("density", 0.0) > 0.5),
         1.0 if "Expand1Hop" in state.get("prev_actions", []) else 0.0,
         1.0 if "Expand2Hop" in state.get("prev_actions", []) else 0.0,
         1.0 if "PPRTopK" in state.get("prev_actions", []) else 0.0,
@@ -56,17 +55,7 @@ def state_to_vector(state: Dict, state_dim: int = 16) -> torch.Tensor:
 
 
 class GRPOPolicy:
-    """GRPO-learned evidence acquisition controller.
-
-    For each target node v_q:
-    1. Initialize G_0 = {v_q}
-    2. Sample K acquisition trajectories
-    3. Each trajectory produces G_T^(i)
-    4. Build prompt P_i and run reasoner to get y_hat_i
-    5. Compute reward R_i = R_pred + beta * R_struct - gamma * R_cost - eta * step_count
-    6. Compute group-relative advantage A_i = R_i - mean_j(R_j)
-    7. Update policy using clipped GRPO objective
-    """
+    """GRPO-learned evidence acquisition controller."""
 
     def __init__(self, state_dim: int = 16, hidden_dim: int = 128,
                  K: int = 4, clip_eps: float = 0.2,
@@ -90,14 +79,10 @@ class GRPOPolicy:
         self.old_network = PolicyNetwork(state_dim, hidden_dim)
 
     def get_state_summary(self, target_node: int, evidence_nodes: Set[int],
-                          edge_index: torch.Tensor, x: torch.Tensor,
-                          y: torch.Tensor, prev_actions: List[str],
+                          adj: dict, y, prev_actions: List[str],
                           token_estimate: int) -> Dict:
         num_nodes = len(evidence_nodes)
-        src, dst = edge_index
-        mask = [(s.item() in evidence_nodes and d.item() in evidence_nodes)
-                for s, d in zip(src, dst)]
-        num_edges = sum(mask)
+        num_edges = sum(len(adj.get(n, set()) & evidence_nodes) for n in evidence_nodes)
         suspicious = sum(1 for n in evidence_nodes if n < len(y) and y[n] == 1)
         density = num_edges / max(num_nodes * (num_nodes - 1), 1)
 
@@ -116,7 +101,6 @@ class GRPOPolicy:
 
     @torch.no_grad()
     def select_action(self, state: Dict, deterministic: bool = False) -> Tuple[str, float]:
-        """Sample or greedily select an action."""
         if state["token_estimate"] >= state["budget_tokens"]:
             return "Stop", 1.0
         if state["num_evidence_nodes"] >= state["budget_nodes"]:
@@ -141,14 +125,11 @@ class GRPOPolicy:
     def compute_reward(self, y_hat_prob: float, y_true: int,
                        struct_stats: Dict, token_cost: int,
                        step_count: int) -> float:
-        """Compute reward R = R_pred + beta * R_struct - gamma * R_cost - eta * step_count."""
-        # Prediction reward: negative CE loss
         eps = 1e-8
         y_hat_clamped = max(eps, min(1 - eps, y_hat_prob))
         ce = -(y_true * np.log(y_hat_clamped) + (1 - y_true) * np.log(1 - y_hat_clamped))
         r_pred = -ce
 
-        # Structural reward
         r_struct = (
             struct_stats.get("high_risk_neighbors", 0) * 0.1 +
             struct_stats.get("density", 0.0) +
@@ -156,16 +137,14 @@ class GRPOPolicy:
             struct_stats.get("cycles_found", 0) * 0.1
         )
 
-        # Cost penalty
         r_cost = token_cost * 0.01
 
         reward = r_pred + self.beta * r_struct - self.gamma * r_cost - self.eta * step_count
         return reward
 
-    def sample_trajectory(self, target_node: int, edge_index: torch.Tensor,
-                          x: torch.Tensor, y: torch.Tensor,
-                          tools: dict, deterministic: bool = False) -> Tuple[Set[int], List[Dict]]:
-        """Sample one acquisition trajectory."""
+    def sample_trajectory(self, target_node: int, adj: dict,
+                          x, y, tools: dict,
+                          deterministic: bool = False) -> Tuple[Set[int], List[Dict]]:
         evidence_nodes = {target_node}
         prev_actions = []
         token_estimate = 0
@@ -173,7 +152,7 @@ class GRPOPolicy:
 
         for step in range(self.max_steps):
             state = self.get_state_summary(
-                target_node, evidence_nodes, edge_index, x, y,
+                target_node, evidence_nodes, adj, y,
                 prev_actions, token_estimate)
 
             action, log_prob = self.select_action(state, deterministic=deterministic)
@@ -196,10 +175,10 @@ class GRPOPolicy:
                 continue
 
             if action == "PruneTopK":
-                new_nodes, info = tool(evidence_nodes, edge_index,
-                                       x.size(0), x=x, target_node=target_node)
+                new_nodes, info = tool(evidence_nodes, adj,
+                                       x=x, target_node=target_node)
             else:
-                new_nodes, info = tool(evidence_nodes, edge_index, x.size(0),
+                new_nodes, info = tool(evidence_nodes, adj,
                                        max_nodes=self.budget_nodes)
 
             evidence_nodes = new_nodes
@@ -215,11 +194,6 @@ class GRPOPolicy:
         return evidence_nodes, trajectory
 
     def update(self, trajectories_and_rewards: List[Tuple[List[Dict], float]]):
-        """GRPO update: clipped objective with group-relative advantage.
-
-        L = E[min(r_i * A_i, clip(r_i, 1-eps, 1+eps) * A_i)]
-        where r_i = pi(a|s) / pi_old(a|s) and A_i = R_i - mean(R)
-        """
         if not trajectories_and_rewards:
             return
 
@@ -240,21 +214,17 @@ class GRPOPolicy:
                 state_vec = step_info["state_vec"]
                 old_log_prob = step_info["log_prob"]
 
-                # Current policy log prob
                 logits = self.network(state_vec)
                 log_probs = F.log_softmax(logits, dim=-1)
                 action_idx = ACTIONS.index(step_info["action"])
                 new_log_prob = log_probs[action_idx]
 
-                # Ratio
                 ratio = torch.exp(new_log_prob - old_log_prob)
 
-                # Clipped objective
                 clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
                 obj = torch.min(ratio * adv_tensor, clipped_ratio * adv_tensor)
                 total_loss = total_loss - obj
 
-                # Entropy bonus
                 probs = F.softmax(logits, dim=-1)
                 entropy = -(probs * log_probs).sum()
                 total_loss = total_loss - self.entropy_coeff * entropy

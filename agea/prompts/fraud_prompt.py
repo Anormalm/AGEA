@@ -8,13 +8,7 @@ from .compressed_prompt import CompressedPromptBuilder
 
 
 class FraudPromptBuilder:
-    """Build fraud reasoning prompts from evidence subgraphs.
-
-    Modes:
-    - raw: Full feature details for each node/edge
-    - compressed: Quantized, aggregated summaries
-    - evidence_only: Only structural patterns, no raw features
-    """
+    """Build fraud reasoning prompts from evidence subgraphs."""
 
     def __init__(self, mode: str = "raw", max_neighbor_summaries: int = 15,
                  max_edge_summaries: int = 30):
@@ -27,11 +21,12 @@ class FraudPromptBuilder:
               edge_index: torch.Tensor, x: torch.Tensor,
               y: torch.Tensor = None,
               node_text: Dict = None, edge_text: Dict = None,
-              struct_stats: Dict = None, budget_info: Dict = None) -> str:
+              struct_stats: Dict = None, budget_info: Dict = None,
+              adj: dict = None) -> str:
         if self.mode == "compressed":
             return self.compressed_builder.build(
                 target_node, evidence_nodes, edge_index, x, y,
-                node_text, edge_text, struct_stats, budget_info)
+                node_text, edge_text, struct_stats, budget_info, adj=adj)
         elif self.mode == "evidence_only":
             return self._build_evidence_only(
                 target_node, evidence_nodes, edge_index, x, y,
@@ -39,18 +34,16 @@ class FraudPromptBuilder:
         else:
             return self.raw_builder.build(
                 target_node, evidence_nodes, edge_index, x, y,
-                node_text, edge_text, struct_stats, budget_info)
+                node_text, edge_text, struct_stats, budget_info, adj=adj)
 
     def _build_evidence_only(self, target_node: int, evidence_nodes: Set[int],
                              edge_index: torch.Tensor, x: torch.Tensor,
                              y: torch.Tensor = None,
                              struct_stats: Dict = None,
                              budget_info: Dict = None) -> str:
-        """Evidence-only: structural patterns without raw features."""
         parts = []
         parts.append(f"Target node: {target_node}")
 
-        # Aggregate statistics only
         neighbors = [n for n in evidence_nodes if n != target_node]
         fraud_count = sum(1 for n in neighbors if y is not None and n < y.size(0) and y[n].item() == 1)
         legit_count = len(neighbors) - fraud_count

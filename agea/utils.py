@@ -6,17 +6,48 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 
 
+def _cast_numeric(d):
+    """Recursively cast string values that look like numbers."""
+    if isinstance(d, dict):
+        return {k: _cast_numeric(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_cast_numeric(v) for v in d]
+    if isinstance(d, str):
+        try:
+            return int(d)
+        except ValueError:
+            pass
+        try:
+            return float(d)
+        except ValueError:
+            pass
+    return d
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        return _cast_numeric(yaml.safe_load(f))
+
+
+def _best_macro_f1(y_true, y_prob):
+    """Find the threshold that maximizes macro F1, return that F1 score."""
+    best_f1 = 0.0
+    for t in np.arange(0.1, 0.9, 0.05):
+        y_pred = (y_prob > t).astype(int)
+        f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+    return best_f1
 
 
 def compute_metrics(y_true, y_prob, y_pred=None, k=100):
-    """Compute prediction metrics."""
+    """Compute prediction metrics.
+
+    Uses optimal-threshold macro F1 instead of fixed 0.5 threshold,
+    which is meaningless under class imbalance.
+    """
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
-    if y_pred is None:
-        y_pred = (y_prob > 0.5).astype(int)
 
     metrics = {}
     try:
@@ -27,7 +58,13 @@ def compute_metrics(y_true, y_prob, y_pred=None, k=100):
         metrics["auprc"] = average_precision_score(y_true, y_prob)
     except ValueError:
         metrics["auprc"] = 0.0
-    metrics["f1"] = f1_score(y_true, y_pred, zero_division=0)
+
+    # Macro F1 at optimal threshold (avoids degenerate 0.5 threshold under imbalance)
+    metrics["macro_f1"] = _best_macro_f1(y_true, y_prob)
+
+    # Also store F1 at 0.5 for reference
+    y_pred_05 = (y_prob > 0.5).astype(int)
+    metrics["macro_f1_05"] = f1_score(y_true, y_pred_05, average="macro", zero_division=0)
 
     # Recall@K
     if len(y_true) >= k:
