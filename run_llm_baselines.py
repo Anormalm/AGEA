@@ -11,6 +11,7 @@ Baselines:
 - GraphGPT: Fixed BFS 2-hop expansion prompt
 - HiGPT: Type-specific 1-hop expansion prompt (heterogeneous)
 - InstructGLM: One-shot PPR + Community prompt
+- DGP (published numbers from Li et al., AAAI 2025, marked † in paper)
 """
 
 import sys
@@ -351,7 +352,248 @@ def collect_evidence_instructglm(target, adj, fraud_labels_np,
     return evidence, 1
 
 
-def run_llm_baselines(data, cfg, device, max_test_nodes=500):
+
+
+# ---- DGP: Dual-Granularity Prompting (Li et al., AAAI 2025) ----
+
+METAPATH_NAMES = {
+    1: "R-U-R (shared-user)",
+    2: "R-S-R (shared-product-star)",
+    3: "shared-product-reviews",
+    4: "R-P-M-R (shared-product-month)",
+}
+
+
+def compute_diffusion_scores(target, neighbors, adj, n_walks=20, walk_len=10, alpha=0.15):
+    """Simplified Markov Diffusion Kernel: random-walk-based importance scoring.
+
+    Runs random walks from the target and counts visit frequencies for each
+    neighbor. This approximates DGP's diffusion-based metapath trimming.
+    """
+    if not neighbors:
+        return {}
+    visit_count = defaultdict(int)
+    adj_lists = {n: list(adj.get(n, set())) for n in [target] + list(neighbors)}
+    rng = np.random.RandomState(42)
+    for _ in range(n_walks):
+        current = target
+        for _ in range(walk_len):
+            nbs = adj_lists.get(current, [])
+            if not nbs:
+                break
+            if rng.random() < alpha:
+                current = target  # restart
+            else:
+                current = nbs[rng.randint(len(nbs))]
+            if current in neighbors:
+                visit_count[current] += 1
+    total = max(sum(visit_count.values()), 1)
+    return {n: c / total for n, c in visit_count.items()}
+
+
+def collect_evidence_dgp(target, adj, fraud_labels_np, type_adj=None,
+                         top_m=15, budget_nodes=50):
+    """DGP evidence collection: metapath-aware trimming with diffusion scoring.
+
+    For heterogeneous graphs (type_adj available): top-M neighbors per metapath
+    re-ranked by diffusion importance. For homogeneous: degree-ranked neighbors
+    up to budget, with diffusion re-ranking for top candidates.
+    """
+    evidence = {target}
+
+    if type_adj is not None and target in type_adj:
+        # Metapath-aware: top-M per edge type, diffusion re-ranked
+        for etype, nbs in type_adj[target].items():
+            ranked = sorted(nbs, key=lambda n: len(adj.get(n, set())), reverse=True)
+            candidates = set(ranked[:top_m * 3])
+            scores = compute_diffusion_scores(target, candidates, adj,
+                                              n_walks=50, walk_len=15)
+            if scores:
+                ranked = sorted(candidates, key=lambda n: scores.get(n, 0), reverse=True)
+                # Append remaining candidates not in diffusion set
+                ranked += [n for n in ranked if n not in set(ranked)]
+            for n in ranked[:top_m]:
+                if len(evidence) >= budget_nodes:
+                    break
+                evidence.add(n)
+    else:
+        # Homogeneous: use all neighbors up to budget, diffusion re-rank if enough
+        all_neighbors = adj.get(target, set())
+        if len(all_neighbors) <= budget_nodes:
+            # Sparse node: just take everything available
+            evidence.update(all_neighbors)
+        else:
+            ranked = sorted(all_neighbors, key=lambda n: len(adj.get(n, set())), reverse=True)
+            candidates = set(ranked[:top_m * 3])
+            scores = compute_diffusion_scores(target, candidates, adj,
+                                              n_walks=50, walk_len=15)
+            if scores:
+                # Diffusion-re-ranked top candidates + remaining by degree
+                top_ranked = sorted(candidates, key=lambda n: scores.get(n, 0), reverse=True)
+                remaining = [n for n in ranked if n not in set(top_ranked)]
+                ranked = top_ranked + remaining
+            for n in ranked[:budget_nodes - 1]:
+                evidence.add(n)
+
+    return evidence, 1
+
+
+def build_dgp_prompt(target, evidence_nodes, adj, fraud_labels_np, probs_all,
+                     type_adj=None, top_m=15):
+    """Build DGP dual-granularity prompt.
+
+    Fine-grained: target node full info + top neighbor details.
+    Coarse-grained: per-metapath summary statistics.
+    Includes concrete neighbor labels for zero-shot LLM reasoning.
+    """
+    prob = probs_all[target].item() if target < len(probs_all) else 0.5
+    node_set = set(evidence_nodes)
+    neighbors = [n for n in node_set if n != target]
+    target_degree = len(adj.get(target, set()))
+
+    parts = []
+    # Fine-grained target description
+    parts.append("=== Fraud Detection Analysis (Dual-Granularity) ===")
+    parts.append(f"Target node: {target}")
+    parts.append(f"GNN classifier fraud probability: {prob:.1%}")
+    parts.append(f"Target node degree: {target_degree}")
+    parts.append(f"Total evidence nodes: {len(node_set)}")
+    parts.append("")
+
+    # Coarse-grained per-metapath summaries
+    if type_adj is not None and target in type_adj:
+        parts.append("=== Per-Metapath Neighbor Summary (coarse-grained) ===")
+        for etype, all_nbs in sorted(type_adj[target].items()):
+            in_evidence = all_nbs & node_set
+            if not in_evidence:
+                continue
+            tname = METAPATH_NAMES.get(etype, f"metapath-{etype}")
+            n_in = len(in_evidence)
+            n_total = len(all_nbs)
+            fraud_count = sum(1 for n in in_evidence
+                             if n < len(fraud_labels_np) and fraud_labels_np[n] == 1)
+            legit_count = sum(1 for n in in_evidence
+                             if n < len(fraud_labels_np) and fraud_labels_np[n] == 0)
+            avg_deg = np.mean([len(adj.get(n, set())) for n in in_evidence]) if in_evidence else 0
+            internal_edges = sum(len(adj.get(n, set()) & in_evidence) for n in in_evidence)
+            density = internal_edges / max(n_in * (n_in - 1), 1)
+            parts.append(f"  {tname}: {n_in}/{n_total} neighbors in evidence")
+            parts.append(f"    Fraud: {fraud_count}, Legit: {legit_count}, "
+                        f"AvgDegree: {avg_deg:.1f}, Density: {density:.3f}")
+    else:
+        # Single-type summary
+        fraud_count = sum(1 for n in neighbors
+                         if n < len(fraud_labels_np) and fraud_labels_np[n] == 1)
+        legit_count = sum(1 for n in neighbors
+                         if n < len(fraud_labels_np) and fraud_labels_np[n] == 0)
+        avg_deg = np.mean([len(adj.get(n, set())) for n in neighbors]) if neighbors else 0
+        internal_edges = sum(len(adj.get(n, set()) & node_set) for n in neighbors)
+        density = internal_edges / max(len(neighbors) * (len(neighbors) - 1), 1)
+        parts.append("=== Neighbor Summary (coarse-grained) ===")
+        parts.append(f"  Neighbors: {len(neighbors)}")
+        parts.append(f"    Fraud: {fraud_count}, Legit: {legit_count}, "
+                    f"AvgDegree: {avg_deg:.1f}, Density: {density:.3f}")
+
+    # Fine-grained: top neighbor details with labels (critical for zero-shot)
+    parts.append("")
+    parts.append("=== Key Neighbors (fine-grained) ===")
+    top_neighbors = sorted(neighbors,
+                          key=lambda n: len(adj.get(n, set())), reverse=True)[:15]
+    for n in top_neighbors:
+        n_deg = len(adj.get(n, set()))
+        label = ""
+        if n < len(fraud_labels_np):
+            if fraud_labels_np[n] == 1:
+                label = " [FRAUD]"
+            elif fraud_labels_np[n] == 0:
+                label = " [LEGIT]"
+        shared = len(adj.get(target, set()) & adj.get(n, set()))
+        parts.append(f"  Node {n}: degree={n_deg}{label}, shared_neighbors={shared}")
+
+    # Numerical aggregation
+    parts.append("")
+    parts.append("=== Numerical Aggregation ===")
+    if neighbors:
+        n_edges = sum(len(adj.get(n, set()) & node_set) for n in node_set)
+        overall_density = n_edges / max(len(node_set) * (len(node_set) - 1), 1)
+        high_risk = sum(1 for n in node_set
+                       if n < len(fraud_labels_np) and fraud_labels_np[n] == 1)
+        high_risk_ratio = high_risk / max(len(node_set), 1)
+        fraud_nbr = high_risk / max(len(node_set) - 1, 1)
+        parts.append(f"Overall density: {overall_density:.3f}")
+        parts.append(f"High-risk ratio: {high_risk_ratio:.3f}")
+        parts.append(f"Fraud neighbor ratio: {fraud_nbr:.3f}")
+        parts.append(f"Total internal edges: {n_edges}")
+
+    parts.append("")
+    parts.append("Based on this dual-granularity evidence, predict whether the "
+                  "target node is involved in fraud (1) or is legitimate (0).")
+    return "\n".join(parts)
+
+
+# ---- AGEA + DGP Combo ----
+
+def collect_evidence_agea_dgp(target, adj, fraud_labels_np, tools, policy,
+                              type_adj=None, budget_nodes=50, x=None):
+    """AGEA+DGP: Use AGEA heuristic policy to collect evidence, then format
+    with DGP's dual-granularity prompting."""
+    y_safe = fraud_labels_np.copy()
+    y_safe = np.where(y_safe < 0, 0, y_safe)
+    y_tensor = torch.from_numpy(y_safe).long()
+    evidence_nodes, traj = policy.run_episode(target, adj, x, y_tensor, tools)
+    n_steps = len([t for t in traj if t.get("action") != "Stop"])
+    return evidence_nodes, n_steps
+
+
+def build_agea_dgp_prompt(target, evidence_nodes, adj, fraud_labels_np, probs_all,
+                          type_adj=None, n_steps=1):
+    """AGEA+DGP: proven build_llm_prompt base + DGP per-metapath breakdown.
+
+    Uses the detailed structural prompt that works zero-shot, then adds
+    a per-metapath neighbor summary section (DGP's contribution) and
+    notes the adaptive acquisition (AGEA's contribution).
+    """
+    # Start with the proven prompt format
+    base = build_llm_prompt(target, evidence_nodes, adj, fraud_labels_np, probs_all,
+                            "AGEA+DGP", type_adj=type_adj, n_steps=n_steps)
+
+    # Append DGP-style per-metapath breakdown
+    node_set = set(evidence_nodes)
+    metapath_section = []
+    metapath_section.append("")
+    metapath_section.append("=== Per-Metapath Breakdown (DGP-style) ===")
+    metapath_section.append(f"Evidence acquired in {n_steps} adaptive steps.")
+
+    if type_adj is not None and target in type_adj:
+        for etype, all_nbs in sorted(type_adj[target].items()):
+            in_evidence = all_nbs & node_set
+            if not in_evidence:
+                continue
+            tname = METAPATH_NAMES.get(etype, f"metapath-{etype}")
+            n_in = len(in_evidence)
+            n_total = len(all_nbs)
+            fraud_count = sum(1 for n in in_evidence
+                             if n < len(fraud_labels_np) and fraud_labels_np[n] == 1)
+            legit_count = sum(1 for n in in_evidence
+                             if n < len(fraud_labels_np) and fraud_labels_np[n] == 0)
+            avg_deg = np.mean([len(adj.get(n, set())) for n in in_evidence]) if in_evidence else 0
+            internal_edges = sum(len(adj.get(n, set()) & in_evidence) for n in in_evidence)
+            density = internal_edges / max(n_in * (n_in - 1), 1)
+            metapath_section.append(f"  {tname}: {n_in}/{n_total} neighbors in evidence")
+            metapath_section.append(f"    Fraud: {fraud_count}, Legit: {legit_count}, "
+                                   f"AvgDegree: {avg_deg:.1f}, Density: {density:.3f}")
+    else:
+        # No metapath info available
+        neighbors = [n for n in node_set if n != target]
+        fraud_count = sum(1 for n in neighbors
+                         if n < len(fraud_labels_np) and fraud_labels_np[n] == 1)
+        legit_count = sum(1 for n in neighbors
+                         if n < len(fraud_labels_np) and fraud_labels_np[n] == 0)
+        metapath_section.append(f"  {len(neighbors)} neighbors: {fraud_count} fraud, {legit_count} legit")
+
+    return base + "\n".join(metapath_section)
+
+def run_llm_baselines(data, cfg, device, max_test_nodes=500, methods_filter=None):
     gt = cfg.get("graph_tools", {})
     tools = {
         "PPRTopK": PPRTopK(alpha=gt.get("ppr_alpha", 0.15), topk=gt.get("ppr_topk", 10)),
@@ -406,6 +648,9 @@ def run_llm_baselines(data, cfg, device, max_test_nodes=500):
         "InstructGLM": lambda t: collect_evidence_instructglm(t, adj, fraud_labels_np,
                                                                tools, budget_nodes),
     }
+
+    if methods_filter is not None:
+        methods = {k: v for k, v in methods.items() if k in methods_filter}
 
     results = {}
 
@@ -491,6 +736,8 @@ def main():
                                  "fakenews_politifact", "fakenews_buzzfeed"])
     parser.add_argument("--max_test_nodes", type=int, default=500,
                         help="Max test nodes to evaluate (LLM calls are expensive)")
+    parser.add_argument("--methods", default="all",
+                        help="Comma-separated list of methods to run (e.g. 'DGP,AGEA+DGP'). Default: all")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -525,8 +772,10 @@ def main():
         fraud_ratio = data.y[valid].float().mean().item()
         print(f"Fraud ratio (labeled): {fraud_ratio:.3f}")
 
+        methods_filter = None if args.methods == 'all' else [m.strip() for m in args.methods.split(',')]
         results = run_llm_baselines(data, cfg, device,
-                                    max_test_nodes=args.max_test_nodes)
+                                    max_test_nodes=args.max_test_nodes,
+                                    methods_filter=methods_filter)
         all_results[ds_name] = results
 
     # Summary

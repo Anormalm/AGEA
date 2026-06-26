@@ -67,3 +67,4 @@ data/FakeNews/
 *.fls
 *.synctex.gz
 *.out
+dataset
